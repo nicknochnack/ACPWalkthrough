@@ -357,7 +357,7 @@ class ACPCallingAgent(MultiStepAgent):
             # Get response from the model
             model_message: ChatMessage = self.model(
                 memory_messages,
-                tools_to_call_from=list(self.tools.values()),
+                tools_to_call_from=list(self.tools.values())[:-1],
                 stop_sequences=["Observation:", "Calling agents:"],
             )
 
