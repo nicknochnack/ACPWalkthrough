@@ -2,6 +2,9 @@ from typing import List, Dict, Callable, Optional, Union, Any, AsyncGenerator
 import importlib.resources
 import yaml
 import json
+import re
+# Import SmolAgentsChatMessage and MessageRole from smolagents.models
+from smolagents.models import ChatMessage as SmolAgentsChatMessage, MessageRole
 from dataclasses import dataclass
 from enum import Enum
 from colorama import Fore
@@ -63,7 +66,8 @@ class AgentCollection:
         Returns:
             Agent or None: The found agent or None if not found
         """
-        for agent in self.agents:
+        # Iterate over the stored (client, agent) tuples
+        for client, agent in self.agents:
             if agent.name == name:
                 return agent
         return None
@@ -81,14 +85,6 @@ class ToolCall:
     name: str
     arguments: Union[Dict[str, Any], str]
     id: Optional[str] = None
-
-
-@dataclass
-class ChatMessage:
-    """Represents a chat message with content and optional tool calls."""
-    content: Optional[str]
-    tool_calls: Optional[List[ToolCall]] = None
-    raw: Any = None
 
 
 class LogLevel(Enum):
@@ -161,23 +157,35 @@ class Tool:
     
         # Extract the input content from either args or kwargs
         content = ""
-        if args and isinstance(args[0], str):
+        
+        # Prioritize 'prompt' or the first input key if defined in tool.inputs
+        if self.inputs and "prompt" in self.inputs:
+            content = kwargs.get("prompt", "")
+        elif self.inputs and list(self.inputs.keys()):
+            first_input_key = list(self.inputs.keys())[0]
+            content = kwargs.get(first_input_key, "")
+        elif args and isinstance(args[0], str): # Fallback for positional string argument
             content = args[0]
-        elif "prompt" in kwargs:
-            content = kwargs["prompt"]
-        elif "input" in kwargs:
-            content = kwargs["input"]
-        elif kwargs:
-            # If no specific key is found, use the first value
+        elif kwargs: # Generic fallback, but less robust
             content = next(iter(kwargs.values()))
+
+        if not content and self.inputs: # If content is still empty, check if any input is required
+            required_inputs = [k for k, v in self.inputs.items() if v.get('required', False)]
+            if required_inputs:
+                self.logger.log(f"Warning: Tool '{self.name}' called without required input: {required_inputs}", level=LogLevel.WARNING)
             
         # Now use the extracted content in your message
         print(Fore.MAGENTA + content + Fore.RESET) 
+
+        # ACP client expects 'input' to be a list of Message objects
         response = await self.client.run_sync(
             agent=self.name, 
             input=[Message(parts=[MessagePart(content=content, content_type="text/plain")])]
         )
+
         print(Fore.RED + str(response) + Fore.RESET) 
+
+        # ACP client returns outputs, typically as a list of Message objects
         return response.output[0].parts[0].content
 
 
@@ -199,15 +207,59 @@ class MultiStepAgent:
         self.managed_agents = kwargs.get("managed_agents", {})
         self.logger = Logger()
         self.state = {}
-        self.input_messages = []
+        # input_messages now stores SmolAgentsChatMessage objects
+        self.input_messages: List[SmolAgentsChatMessage] = []
     
     def initialize_system_prompt(self) -> str:
         """Generate the system prompt for the agent."""
         raise NotImplementedError
     
-    def write_memory_to_messages(self):
-        """Convert agent memory to a list of messages for the model."""
-        # Implementation would depend on memory structure
+    def write_memory_to_messages(self) -> List[SmolAgentsChatMessage]:
+        """
+        Converts the internal message representation to a list of SmolAgentsChatMessage objects,
+        ensuring content is formatted as list[dict[str, Any]] for text.
+        This acts as a safety net before passing messages to the model.
+        """
+        cleaned_messages = []
+        for msg in self.input_messages:
+            if isinstance(msg, SmolAgentsChatMessage):
+                # Ensure content is in the expected list format for SmolAgentsChatMessage
+                if isinstance(msg.content, str):
+                    msg.content = [{"type": "text", "text": msg.content}]
+                elif msg.content is None:
+                    msg.content = []
+                elif isinstance(msg.content, list):
+                    for i, item in enumerate(msg.content):
+                        if isinstance(item, str):
+                            msg.content[i] = {"type": "text", "text": item}
+                        elif not isinstance(item, dict) or "type" not in item or "text" not in item:
+                            self.logger.log(f"Warning: Malformed content part in ChatMessage: {item}", level=LogLevel.WARNING)
+                cleaned_messages.append(msg)
+            elif isinstance(msg, dict):
+                # Attempt to convert dict to SmolAgentsChatMessage (fallback)
+                try:
+                    role_enum = MessageRole(msg.get("role"))
+                    content_val = msg.get("content")
+                    if isinstance(content_val, str):
+                        content_val = [{"type": "text", "text": content_val}]
+                    elif content_val is None:
+                        content_val = []
+
+                    cleaned_messages.append(
+                        SmolAgentsChatMessage(
+                            role=role_enum,
+                            content=content_val,
+                            tool_calls=msg.get("tool_calls")
+                        )
+                    )
+                except ValueError as e:
+                    self.logger.log(f"Error converting message dict to SmolAgentsChatMessage: {msg} - {e}", level=LogLevel.ERROR)
+                    cleaned_messages.append(msg)
+            else:
+                self.logger.log(f"Unexpected message type in input_messages: {type(msg)} - {msg}", level=LogLevel.ERROR)
+                cleaned_messages.append(msg)
+
+        self.input_messages = cleaned_messages # Update the list with cleaned messages
         return self.input_messages
     
     async def step(self, memory_step: ActionStep) -> Union[None, Any]:
@@ -239,8 +291,10 @@ class ACPCallingAgent(MultiStepAgent):
     
     def __init__(
         self,
-        acp_agents: Dict[str, Agent],
-        model: Callable[[List[Dict[str, str]]], ChatMessage],
+        # Corrected type hint for acp_agents to reflect {'agent':Agent, 'client':Client} structure
+        acp_agents: Dict[str, Dict[str, Any]],
+        # Corrected type hint for model to expect SmolAgentsChatMessage
+        model: Callable[[List[SmolAgentsChatMessage]], SmolAgentsChatMessage],
         prompt_templates: Optional[Dict[str, str]] = None,
         planning_interval: Optional[int] = None,
         **kwargs,
@@ -269,41 +323,33 @@ class ACPCallingAgent(MultiStepAgent):
         
         # Convert ACP agents to a format similar to tools
         acp_tools = {}
-        for name, agent in acp_agents.items():
-            # Create a callable that will invoke the ACP agent
+
+        # Iterate over agent_info dict, which contains 'agent' and 'client'
+        for name, agent_info in acp_agents.items():
+            agent_obj = agent_info['agent'] # Access the Agent object
+            client_obj = agent_info['client'] # Access the Client object
+            
             acp_tools[name] = Tool(
                 name=name,
-                description=agent['agent'].description,
-                inputs={"input": {"type":"string","description":"the prompt to pass to the agent"}},
+                description=agent_obj.description, # Access description from Agent object
+                inputs={"prompt": {"type":"string","description":f"The prompt to pass to the {name} agent"}},
                 output_type="str",
-                client=agent['client']
+                client=client_obj # Pass the correct client object
             )
-            
-            # Override the __call__ method to make it actually call the ACP agent
-            def make_caller(agent_name, client):
-                async def call_agent(prompt, **kwargs):
-                    print(f"Calling {agent_name} with prompt: {prompt}")
-                    response = await client.run_sync(
-                        agent=agent_name, 
-                        inputs=[Message(parts=[MessagePart(content=prompt, content_type="text/plain")])]
-                    )
-                    return response.outputs[0].parts[0].content
-                return call_agent
-
-            acp_tools[name].__call__ = make_caller(name, agent['client'])  # This line isn't actually using the agent's client
         
         # Add final_answer tool
         acp_tools["final_answer"] = Tool(
             name="final_answer",
             description="Provide the final answer to the user's request",
-            inputs={"answer": "The final answer to provide to the user"},
+            # Corrected inputs format for final_answer tool to match JSON schema expectation
+            inputs={"answer": {"type":"string", "description": "The final answer to provide to the user"}},
             output_type="str"
         )
         
-        async def final_answer(answer, **kwargs):
+        async def final_answer_func(answer: str, **kwargs): # Added type hint for clarity
             return answer
         
-        acp_tools["final_answer"].__call__ = final_answer
+        acp_tools["final_answer"].__call__ = final_answer_func
         
         super().__init__(
             tools=acp_tools,
@@ -317,9 +363,13 @@ class ACPCallingAgent(MultiStepAgent):
     
     def initialize_system_prompt(self) -> str:
         """Generate the system prompt for the agent with ACP agent information."""
+        # Access agent description correctly from agent_info dict
         agent_descriptions = "\n".join(
-            [f"- {name}: {agent['agent'].description}" for name, agent in self.acp_agents.items()]
+            [f"- {name}: {agent_info['agent'].description}" for name, agent_info in self.acp_agents.items()]
         )
+        # Add final_answer tool description to prompt
+        final_answer_tool_desc = self.tools['final_answer'].description
+        agent_descriptions += f"\n- final_answer: {final_answer_tool_desc}"
         
         system_prompt = populate_template(
             self.prompt_templates["system_prompt"],
@@ -339,30 +389,26 @@ class ACPCallingAgent(MultiStepAgent):
         Perform one step in the reasoning process: the agent thinks, calls ACP agents, and observes results.
         Returns None if the step is not final.
         """
-        # Convert messages to LiteLLM format
+        # Use write_memory_to_messages to get cleaned messages, which ensures SmolAgentsChatMessage objects
         memory_messages = self.write_memory_to_messages()
-        # Make sure all messages are in the correct LiteLLM format
-        for i, message in enumerate(memory_messages):
-            if "content" in message and not isinstance(message["content"], list):
-                memory_messages[i]["content"] = [{"type": "text", "text": message["content"]}]
-        
-        self.input_messages = memory_messages
         memory_step.model_input_messages = memory_messages.copy()
         
         try:
             import logging
-            import sys 
-            logging.warn(list(self.tools.values())[:-1])
-            # sys.exit()
-            # Get response from the model
-            model_message: ChatMessage = self.model(
+            logging.warning(f"Tools being passed to model: {[tool.name for tool in list(self.tools.values())[:-1]]}")
+            # Ensure model receives SmolAgentsChatMessage objects, which write_memory_to_messages now guarantees
+            model_message: SmolAgentsChatMessage = self.model(
                 memory_messages,
                 tools_to_call_from=list(self.tools.values())[:-1],
                 stop_sequences=["Observation:", "Calling agents:"],
             )
-
             memory_step.model_output_message = model_message
         except Exception as e:
+            # Improved error logging to show message format accurately for SmolAgentsChatMessage
+            error_details_message_format = [msg.dict() if hasattr(msg, 'dict') else { 'role': str(msg.role), 'content': msg.content, 'tool_calls': msg.tool_calls} for msg in memory_messages]
+            error_details_tools = [tool.name for tool in list(self.tools.values())[:-1]]
+            self.logger.log(f"Error details - message format: {error_details_message_format}", level=LogLevel.ERROR)
+            self.logger.log(f"Error details - tools: {error_details_tools}", level=LogLevel.ERROR)
             raise AgentParsingError(f"Error while generating or parsing output:\n{e}", self.logger) from e
         
         self.logger.log_markdown(
@@ -371,79 +417,63 @@ class ACPCallingAgent(MultiStepAgent):
             level=LogLevel.DEBUG,
         )
         
-        # Check if the model called any tools/agents
-        if not hasattr(model_message, 'tool_calls') or model_message.tool_calls is None or len(model_message.tool_calls) == 0:
-            # If no tool calls, treat content as final answer
-            if model_message.content and "final_answer" in model_message.content.lower():
-                self.logger.log(
-                    f"Final answer detected in content: {model_message.content}",
-                    level=LogLevel.INFO,
-                )
-                memory_step.action_output = model_message.content
-                return model_message.content
-            else:
-                # Try to extract a tool call from the content using a simple parser
-                content = model_message.content or ""
-                if "tool:" in content.lower() or "agent:" in content.lower():
-                    try:
-                        # Very simple extraction - could be enhanced with regex
-                        lines = content.split('\n')
-                        tool_line = next((line for line in lines if "tool:" in line.lower() or "agent:" in line.lower()), None)
-                        if tool_line:
-                            parts = tool_line.split(":", 1)
-                            if len(parts) > 1:
-                                agent_name = parts[1].strip()
-                                # Find arguments
-                                arg_line = next((line for line in lines if "arguments:" in line.lower()), None)
-                                agent_arguments = {}
-                                if arg_line:
-                                    arg_parts = arg_line.split(":", 1)
-                                    if len(arg_parts) > 1:
-                                        try:
-                                            # Try to parse as JSON
-                                            agent_arguments = json.loads(arg_parts[1].strip())
-                                        except json.JSONDecodeError:
-                                            # If not valid JSON, use as string
-                                            agent_arguments = {"prompt": arg_parts[1].strip()}
-                                else:
-                                    # If no arguments line, use rest of content as prompt
-                                    remaining_content = "\n".join(lines[lines.index(tool_line)+1:])
-                                    agent_arguments = {"prompt": remaining_content.strip()}
-                                
-                                # Create a synthetic tool call
-                                memory_step.model_output = str(f"Called Agent: '{agent_name}' with arguments: {agent_arguments}")
-                                memory_step.tool_calls = [ToolCall(name=agent_name, arguments=agent_arguments, id="synthetic_id")]
-                                
-                                # Process the extracted tool call below
-                                return await self._process_tool_call(memory_step, agent_name, agent_arguments)
-                    except Exception as e:
-                        self.logger.log(f"Error parsing tool call from content: {e}", level=LogLevel.ERROR)
-                
-                raise AgentParsingError(
-                    "Model did not call any agents and no final answer detected. Content: " + (model_message.content or "None"), 
-                    self.logger
-                )
-        
-        # Process the tool call
-        tool_call = model_message.tool_calls[0]
-        
-        # Handle different tool call format structures
-        if hasattr(tool_call, 'function') and hasattr(tool_call.function, 'name'):
-            # Standard OpenAI-like format
-            agent_name = tool_call.function.name
-            agent_arguments = tool_call.function.arguments
-            tool_call_id = getattr(tool_call, 'id', 'unknown_id')
-        elif hasattr(tool_call, 'name'):
-            # Simplified format
-            agent_name = tool_call.name
-            agent_arguments = getattr(tool_call, 'arguments', {})
-            tool_call_id = getattr(tool_call, 'id', 'unknown_id')
-        else:
-            # Try to parse as dict
-            agent_name = tool_call.get('name', tool_call.get('function', {}).get('name', 'unknown'))
-            agent_arguments = tool_call.get('arguments', tool_call.get('function', {}).get('arguments', {}))
-            tool_call_id = tool_call.get('id', 'unknown_id')
+        # Unified tool call parsing logic
+        if not (hasattr(model_message, 'tool_calls') and model_message.tool_calls):
+            # If no tool calls, treat content as final answer or try to parse implicit tool call
+            if model_message.content:
+                # Content from model could be a list of dicts. Extract text.
+                extracted_content_text = ""
+                if isinstance(model_message.content, list) and model_message.content and "text" in model_message.content[0]:
+                    extracted_content_text = model_message.content[0]["text"]
+                elif isinstance(model_message.content, str): # Fallback if model gives raw string unexpectedly
+                    extracted_content_text = model_message.content
+                else:
+                    extracted_content_text = str(model_message.content) # Convert to string for general handling
+
+                if "final_answer" in extracted_content_text.lower():
+                    self.logger.log(
+                        f"Final answer detected in content: {extracted_content_text}",
+                        level=LogLevel.INFO,
+                    )
+                    memory_step.action_output = extracted_content_text
+                    return extracted_content_text
+                else:
+                    # Attempt to parse tool call from raw content using regex
+                    # Ensure 're' is imported at the top of the file
+                    tool_match = re.search(r'(?:tool|agent):\s*(\w+)\s*(?:arguments:\s*(.*))?', extracted_content_text, re.IGNORECASE | re.DOTALL)
+                    if tool_match:
+                        agent_name = tool_match.group(1)
+                        raw_args = tool_match.group(2)
+                        agent_arguments = {}
+                        if raw_args:
+                            try:
+                                agent_arguments = json.loads(raw_args.strip())
+                            except json.JSONDecodeError:
+                                agent_arguments = {"prompt": raw_args.strip()}
+                        elif agent_name in self.tools and "prompt" in self.tools[agent_name].inputs:
+                            # If no explicit arguments provided, use remaining content as prompt.
+                            # This needs to be robust for various model output styles.
+                            remaining_content_start = extracted_content_text.find(tool_match.group(0)) + len(tool_match.group(0))
+                            remaining_content = extracted_content_text[remaining_content_start:].strip()
+                            if remaining_content:
+                                agent_arguments = {"prompt": remaining_content}
+
+                        memory_step.model_output = str(f"Called Agent: '{agent_name}' with arguments: {agent_arguments}")
+                        memory_step.tool_calls = [ToolCall(name=agent_name, arguments=agent_arguments, id="synthetic_id")]
+                        return await self._process_tool_call(memory_step, agent_name, agent_arguments)
             
+            raise AgentParsingError(
+                "Model did not call any agents and no final answer detected. Content: " + (str(model_message.content) or "None"), 
+                self.logger
+            )
+        
+        # Standardized access for SmolAgentsChatMessageToolCall
+        tool_call = model_message.tool_calls[0] # This is a SmolAgentsChatMessageToolCall object
+        
+        agent_name = tool_call.function.name
+        agent_arguments = tool_call.function.arguments
+        tool_call_id = tool_call.id # Directly access .id
+
         memory_step.model_output = str(f"Called Agent: '{agent_name}' with arguments: {agent_arguments}")
         memory_step.tool_calls = [ToolCall(name=agent_name, arguments=agent_arguments, id=tool_call_id)]
         
@@ -463,10 +493,7 @@ class ACPCallingAgent(MultiStepAgent):
         if agent_name == "final_answer":
             # Handle the final answer
             if isinstance(agent_arguments, dict):
-                if "answer" in agent_arguments:
-                    answer = agent_arguments["answer"]
-                else:
-                    answer = agent_arguments
+                answer = agent_arguments.get("answer", agent_arguments) # Use .get for safety
             else:
                 answer = agent_arguments
             
@@ -474,13 +501,13 @@ class ACPCallingAgent(MultiStepAgent):
             if isinstance(answer, str) and answer in self.state:
                 final_answer = self.state[answer]
                 self.logger.log(
-                    f"Final answer: Extracting key '{answer}' from state to return value '{final_answer}'.",
+                    f" Extracting key '{answer}' from state to return value '{final_answer}'.",
                     level=LogLevel.INFO,
                 )
             else:
                 final_answer = answer
                 self.logger.log(
-                    f"Final answer: {final_answer}",
+                    f"Final result: {final_answer}", # Changed log message for clarity
                     level=LogLevel.INFO,
                 )
             
@@ -491,6 +518,7 @@ class ACPCallingAgent(MultiStepAgent):
             if agent_arguments is None:
                 agent_arguments = {}
             
+            # Removed sanitize_inputs_outputs as it's not a universal kwarg
             observation = await self.execute_tool_call(agent_name, agent_arguments)
             updated_information = str(observation).strip()
 
@@ -511,6 +539,9 @@ class ACPCallingAgent(MultiStepAgent):
                 key: self.state.get(value, value) if isinstance(value, str) else value
                 for key, value in arguments.items()
             }
+        # Added handling for string arguments directly mapping to state
+        if isinstance(arguments, str):
+            return self.state.get(arguments, arguments)
         return arguments
     
     async def execute_tool_call(self, agent_name: str, arguments: Union[Dict[str, str], str]) -> Any:
@@ -535,9 +566,14 @@ class ACPCallingAgent(MultiStepAgent):
         try:
             # Call agent with appropriate arguments
             if isinstance(arguments, dict):
-                return await tool(**arguments, sanitize_inputs_outputs=True)
+                # Removed sanitize_inputs_outputs here
+                return await tool(**arguments)
             elif isinstance(arguments, str):
-                return await tool(arguments, sanitize_inputs_outputs=True)
+                # Check for 'prompt' input for string arguments
+                if tool.inputs and "prompt" in tool.inputs:
+                    return await tool(prompt=arguments)
+                else:
+                    return await tool(arguments)
             else:
                 raise TypeError(f"Unsupported arguments type: {type(arguments)}")
                 
@@ -573,8 +609,10 @@ class ACPCallingAgent(MultiStepAgent):
             str: Final answer from the agent
         """
         # Initialize memory with the user query in the correct format for LiteLLM
-        user_message = {"role": "user", "content": [{"type": "text", "text": query}]}
-        system_message = {"role": "system", "content": [{"type": "text", "text": self.initialize_system_prompt()}]}
+        # Initialize messages as SmolAgentsChatMessage objects with list content
+        user_message = SmolAgentsChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": query}])
+        system_prompt_text = self.initialize_system_prompt()
+        system_message = SmolAgentsChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": system_prompt_text}])
         self.input_messages = [system_message, user_message]
         
         # Run steps until we get a final answer or hit max steps
@@ -584,14 +622,15 @@ class ACPCallingAgent(MultiStepAgent):
 
             # Add memory context to the messages if we have any state
             if self.state and step_num > 0:
-                memory_context = "Current memory state:\n"
+                memory_context_text = "Current memory state:\n" # Renamed to avoid confusion with the dict
                 for key, value in self.state.items():
-                    memory_context += f"- {key}: {value}\n"
+                    memory_context_text += f"- {key}: {value}\n"
                 
-                self.input_messages.append({
-                    "role": "system",
-                    "content": [{"type": "text", "text": memory_context}]
-                })
+                # Append new messages as SmolAgentsChatMessage objects with list content
+                self.input_messages.append(SmolAgentsChatMessage(
+                    role=MessageRole.SYSTEM,
+                    content=[{"type": "text", "text": memory_context_text}]
+                ))
             
             # Create a new action step and execute it
             memory_step = ActionStep()
@@ -607,30 +646,33 @@ class ACPCallingAgent(MultiStepAgent):
                 if hasattr(memory_step, 'observations') and memory_step.observations:
                     # Add assistant message if it exists
                     if hasattr(memory_step, 'model_output_message') and memory_step.model_output_message:
-                        content = ""
-                        if hasattr(memory_step.model_output_message, 'content'):
-                            content = memory_step.model_output_message.content
-                        elif hasattr(memory_step.model_output_message, 'raw'):
-                            content = str(memory_step.model_output_message.raw)
-                        
-                        if content:
-                            self.input_messages.append({
-                                "role": "assistant",
-                                "content": [{"type": "text", "text": content}]
-                            })
+                        content_from_model = memory_step.model_output_message.content
+                        # Ensure content_from_model is formatted as list[dict] if it's text
+                        if isinstance(content_from_model, str):
+                            content_from_model = [{"type": "text", "text": content_from_model}]
+                        elif content_from_model is None:
+                            content_from_model = [] # Default to empty list for None content
+
+                        if content_from_model:
+                            self.input_messages.append(SmolAgentsChatMessage(
+                                role=MessageRole.ASSISTANT,
+                                content=content_from_model
+                            ))
                     
                     # Add observation as user message
-                    self.input_messages.append({
-                        "role": "user", 
-                        "content": [{"type": "text", "text": f"Observation: {memory_step.observations}"}]
-                    })
+                    # Ensure observation message content is list[dict]
+                    self.input_messages.append(SmolAgentsChatMessage(
+                        role=MessageRole.USER, 
+                        content=[{"type": "text", "text": f"Observation: {memory_step.observations}"}]
+                    ))
             except Exception as e:
                 self.logger.log(f"Error in step {step_num + 1}: {str(e)}", level=LogLevel.ERROR)
                 # Add error message to conversation
-                self.input_messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": f"Error occurred: {str(e)}. Please try a different approach or provide a final answer."}]
-                })
+                # Ensure error message content is list[dict]
+                self.input_messages.append(SmolAgentsChatMessage(
+                    role=MessageRole.SYSTEM, # Changed to system role for error messages
+                    content=[{"type": "text", "text": f"Error occurred: {str(e)}. Please try a different approach or provide a final answer."}]
+                ))
         
         # If we hit max steps without a final answer
         return "I wasn't able to complete this task within the maximum number of steps."
